@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Disassemble a knod shader dump.
+
+The kernel's debugfs "insn" files hand out the shader as hex dwords and say
+which target they were built for.  Everything else - mnemonics, operands,
+offsets - comes from LLVM here, so the kernel does not carry an opcode table
+per GPU generation.
+
+  knod-disasm /sys/kernel/debug/dri/128/knod/bpf/insn
+  sudo cat /sys/kernel/debug/dri/128/knod/ipsec/insn | knod-disasm --hex
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+# llvm-mc names the wave size as a target feature rather than an option.
+WAVE_ATTR = {32: "+wavefrontsize32", 64: "+wavefrontsize64"}
+
+DWORD_RE = re.compile(r"^[0-9a-fA-F]{8}$")
+
+# llvm-objdump puts the address and the bytes an instruction was made of in a
+# trailing comment, and for a branch the target it worked out as well:
+#   v_add_nc_u32_e32 v1, 40, v1        // 000000000000: 4A0202FF 00000028
+#   s_cbranch_execz 4                  // 000000000004: BF880004 <.text+0x18>
+OBJDUMP_RE = re.compile(
+    r"^\s*(\S.*?)\s+//\s*([0-9A-Fa-f]+):\s*((?:[0-9A-Fa-f]{8}\s*)+?)"
+    r"(?:<[^>+]*\+?(0x[0-9A-Fa-f]+)?>)?\s*$"
+)
+
+
+def expand_tabs(text, stop=8):
+    """Width of a line once its tabs are expanded."""
+    col = 0
+    for ch in text:
+        col = (col + stop) & ~(stop - 1) if ch == "\t" else col + 1
+    return col
+
+
+def parse_meta(text):
+    """Collect the "# key value" header a dump opens with."""
+    meta = {}
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("#"):
+            continue
+        field = line.lstrip("#").split(None, 1)
+        if len(field) == 2:
+            meta[field[0]] = field[1].strip()
+
+    return meta
+
+
+def parse_block(text):
+    """A block dump is nothing but dwords."""
+    dwords = []
+
+    for line in text.splitlines():
+        if line.startswith("#"):
+            continue
+        for word in line.split():
+            if DWORD_RE.match(word):
+                dwords.append(int(word, 16))
+
+    return dwords
+
+
+def split_annotated(line):
+    """Pull the dwords out of one annotated line.
+
+    A line reads "<prefix><dwords> [; tag]", where the prefix says where the
+    instruction sits and the tag where it came from.  Both are about the BPF
+    program rather than the ISA, so they are kept as they are.
+    """
+    body, sep, tag = line.partition(";")
+    words = body.split()
+
+    first = next((i for i, w in enumerate(words) if DWORD_RE.match(w)), None)
+    if first is None:
+        return None
+
+    last = first
+    while last + 1 < len(words) and DWORD_RE.match(words[last + 1]):
+        last += 1
+
+    return (
+        " ".join(words[:first]),
+        [int(w, 16) for w in words[first:last + 1]],
+        (sep + tag).rstrip(),
+    )
+
+
+def run(argv, **kwargs):
+    got = subprocess.run(argv, capture_output=True, text=True, **kwargs)
+    if got.returncode != 0:
+        sys.exit(f"knod-disasm: {argv[0]} failed:\n{got.stderr.strip()}")
+    return got
+
+
+def disassemble(dwords, mcpu, wave):
+    """Name the instructions the dwords hold.
+
+    Returns (offset, [dwords], mnemonic) per instruction, with the offset and
+    the dwords being what LLVM actually consumed.
+
+    This goes through an object file rather than "llvm-mc --disassemble"
+    because --show-encoding reports the canonical re-encoding of what it
+    decoded, not the bytes it read.  An instruction carrying a literal comes
+    back four bytes shorter than it is - llvm re-spells the literal as an
+    inline constant where it can - so lengths taken from it are wrong and
+    every offset after the first literal is too.
+    """
+    if not dwords:
+        return []
+
+    source = ["\t.text"]
+    for at in range(0, len(dwords), 4):
+        octets = [b for d in dwords[at:at + 4] for b in d.to_bytes(4, "little")]
+        source.append("\t.byte " + ",".join(f"0x{b:02x}" for b in octets))
+
+    triple = ["-triple=amdgcn-amd-amdhsa", f"-mcpu={mcpu}"]
+    if wave in WAVE_ATTR:
+        triple.append(f"--mattr={WAVE_ATTR[wave]}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        asm, obj = os.path.join(tmp, "d.s"), os.path.join(tmp, "d.o")
+        with open(asm, "w") as f:
+            f.write("\n".join(source) + "\n")
+        run(["llvm-mc", *triple, "-filetype=obj", asm, "-o", obj])
+        out = run(["llvm-objdump", "-d", f"--mcpu={mcpu}",
+                   *[a for a in triple if a.startswith("--mattr")], obj])
+
+    insns = []
+    for line in out.stdout.splitlines():
+        got = OBJDUMP_RE.match(line)
+        if not got:
+            continue
+        insn = got.group(1).strip()
+        if got.group(4):
+            # A branch's operand is a distance; say where it lands as well.
+            insn += f"    -> {int(got.group(4), 16):04x}"
+        insns.append((int(got.group(2), 16),
+                      [int(w, 16) for w in got.group(3).split()], insn))
+
+    seen = sum(len(dw) for _, dw, _ in insns)
+    if seen != len(dwords):
+        print(f"knod-disasm: warning: named {seen} of {len(dwords)} dwords",
+              file=sys.stderr)
+
+    return insns
+
+
+def emit_block(text, mcpu, wave, show_hex):
+    dwords = parse_block(text)
+    if not dwords:
+        sys.exit("knod-disasm: no hex dwords in the dump")
+
+    for off, raw, insn in disassemble(dwords, mcpu, wave):
+        if show_hex:
+            hexed = " ".join(f"{d:08x}" for d in raw)
+            print(f"{off:04x}: {hexed:<26} {insn}")
+        else:
+            print(f"{off:04x}: {insn}")
+
+
+def emit_annotated(text, mcpu, wave, show_hex):
+    """Replace each line's dwords with what they mean, keeping the rest.
+
+    The whole dump goes through LLVM at once and the results are handed back
+    out in order.  Each one is checked against the dwords of the line it lands
+    on, so a line that fails to decode shows up rather than silently shifting
+    everything after it.
+    """
+    parsed = [(line, split_annotated(line)) for line in text.splitlines()
+              if not line.startswith("#")]
+    named = disassemble([d for _, got in parsed if got for d in got[1]],
+                        mcpu, wave)
+
+    rows, at = [], 0
+    for line, got in parsed:
+        if got is None:
+            rows.append((line, ""))
+            continue
+
+        prefix, dwords, tag = got
+        if at < len(named) and named[at][1] == dwords:
+            insn = named[at][2]
+            at += 1
+        else:
+            insn = "(undecoded) " + " ".join(f"{d:08x}" for d in dwords)
+            # Skip whatever LLVM made of these dwords so the rest stays lined up.
+            behind = 0
+            while at < len(named) and behind < len(dwords):
+                behind += len(named[at][1])
+                at += 1
+
+        if show_hex:
+            hexed = " ".join(f"{d:08x}" for d in dwords)
+            rows.append((f"{prefix}\t{hexed:<26} {insn}", tag))
+        else:
+            rows.append((f"{prefix}\t{insn}", tag))
+
+    width = max((expand_tabs(body) for body, tag in rows if tag), default=0)
+    for body, tag in rows:
+        if not tag:
+            print(body)
+        else:
+            print(f"{body}{' ' * (width - expand_tabs(body))}  {tag}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("dump", nargs="?", default="-",
+                    help='shader dump, or "-" for stdin (the default)')
+    ap.add_argument("--mcpu",
+                    help="override the target the dump names, e.g. gfx1030")
+    ap.add_argument("--wave", type=int, choices=(32, 64),
+                    help="override the wave size the dump names")
+    ap.add_argument("--hex", action="store_true",
+                    help="show the raw dwords alongside the disassembly")
+    args = ap.parse_args()
+
+    if args.dump == "-":
+        text = sys.stdin.read()
+    else:
+        with open(args.dump) as f:
+            text = f.read()
+
+    meta = parse_meta(text)
+    mcpu = args.mcpu or meta.get("mcpu")
+    if not mcpu:
+        sys.exit("knod-disasm: the dump names no target; pass --mcpu")
+    wave = args.wave or int(meta.get("wave", 64))
+
+    for key in ("knod", "entry"):
+        if key in meta:
+            print(f"# {key} {meta[key]}")
+    print(f"# {mcpu}, wave{wave}\n")
+
+    if meta.get("format", "block") == "annotated":
+        emit_annotated(text, mcpu, wave, args.hex)
+    else:
+        emit_block(text, mcpu, wave, args.hex)
+
+
+if __name__ == "__main__":
+    main()
