@@ -24,11 +24,12 @@ WAVE_ATTR = {32: "+wavefrontsize32", 64: "+wavefrontsize64"}
 DWORD_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 
 # llvm-objdump puts the address and the bytes an instruction was made of in a
-# trailing comment, and for a branch the target it worked out as well:
+# trailing comment, and for a branch the target it worked out as well.  A long
+# enough instruction leaves no space before the comment, so do not require one:
 #   v_add_nc_u32_e32 v1, 40, v1        // 000000000000: 4A0202FF 00000028
 #   s_cbranch_execz 4                  // 000000000004: BF880004 <.text+0x18>
 OBJDUMP_RE = re.compile(
-    r"^\s*(\S.*?)\s+//\s*([0-9A-Fa-f]+):\s*((?:[0-9A-Fa-f]{8}\s*)+?)"
+    r"^\s*(\S.*?)\s*//\s*([0-9A-Fa-f]+):\s*((?:[0-9A-Fa-f]{8}\s*)+?)"
     r"(?:<[^>+]*\+?(0x[0-9A-Fa-f]+)?>)?\s*$"
 )
 
