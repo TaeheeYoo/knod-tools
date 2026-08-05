@@ -26,8 +26,10 @@ KIND_PROLOGUE = 9
 
 MCPU = {9: "gfx900", 10: "gfx1030", 11: "gfx1100"}
 
-# The kernel prints offsets in decimal, knod-disasm in hex.
-INSN_RE = re.compile(r"^\s*([0-9a-fA-F]+):\s+(\S.*?)\s*$")
+# Both sides are named by knod-disasm, so both come back in hex.  The tag the
+# BPF dump carries says which BPF instruction a line came from and is not part
+# of what is being compared.
+INSN_RE = re.compile(r"^\s*([0-9a-fA-F]+):\s+(\S.*?)\s*(?:;.*)?$")
 
 
 def read_blob(path):
@@ -69,15 +71,23 @@ def parse(text, base):
     return out
 
 
-def kernel_prologue(dump):
+def kernel_prologue(path):
     """The prologue section of a debugfs dump, up to where the JIT takes over.
+
+    The dump holds dwords, so it goes through knod-disasm the same way the blob
+    does - naming them two different ways would compare two different things.
 
     What follows the fixed part is the exec-save zeroing, one instruction per
     pair the program's control flow needs, so the comparison stops there.
     """
+    got = subprocess.run(["knod-disasm", path], capture_output=True, text=True)
+    if got.returncode != 0:
+        sys.exit(f"knod-blob-check: knod-disasm failed on the dump:\n"
+                 f"{got.stderr.strip()}")
+
     section = []
     inside = False
-    for line in dump.splitlines():
+    for line in got.stdout.splitlines():
         if "===[PROLOGUE]===" in line:
             inside = True
             continue
@@ -106,7 +116,7 @@ def main():
     if isa not in MCPU:
         sys.exit(f"{args.blob}: unknown isa {isa}")
 
-    want = kernel_prologue(open(args.dump).read())
+    want = kernel_prologue(args.dump)
     got = disassemble(entries[KIND_PROLOGUE], MCPU[isa], wave)
 
     # The kernel's prologue carries the variable tail; compare what the blob
@@ -116,7 +126,10 @@ def main():
         sys.exit(f"knod-blob-check: the dump ends after {len(want)} "
                  f"instructions, the blob has {len(got)}")
 
-    bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]
+    # Compare the instructions themselves.  The offsets are shown but not
+    # compared: the kernel counts them in decimal and knod-disasm in hex, and
+    # instructions that match in sequence are the same length anyway.
+    bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w[1] != g[1]]
     for i, w, g in bad:
         print(f"[{i}] kernel {w[0]:5}  {w[1]}")
         print(f"     blob   {g[0]:5}  {g[1]}")
