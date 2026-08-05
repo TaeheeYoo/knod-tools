@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Check a blob routine against what the kernel emits for it.
+
+The kernel's JIT and the prebuilt routines have to agree instruction for
+instruction, and nothing says so on its own: a change to one is not a build
+error in the other, and a shader that is wrong in this way tends to read the
+wrong memory rather than fault.
+
+  knod-blob-check /sys/kernel/debug/dri/128/knod/bpf/insn build/knod-bpf-gfx10.bin
+
+Only the prologue is checked today, because it is the only routine the kernel
+emits in a place a dump shows whole.
+"""
+
+import argparse
+import re
+import struct
+import subprocess
+import sys
+
+HDR = "<8I"
+ENTRY = "<6I"
+MAGIC = 0x4b4e4442
+KIND_PROLOGUE = 9
+
+MCPU = {9: "gfx900", 10: "gfx1030", 11: "gfx1100"}
+
+# The kernel prints offsets in decimal, knod-disasm in hex.
+INSN_RE = re.compile(r"^\s*([0-9a-fA-F]+):\s+(\S.*?)\s*$")
+
+
+def read_blob(path):
+    """-> (isa, wave, {kind: dwords})"""
+    raw = open(path, "rb").read()
+    magic, abi, isa, link, wave, n, eoff, _ = struct.unpack(HDR, raw[:32])
+    if magic != MAGIC:
+        sys.exit(f"{path}: not a knod blob")
+
+    out = {}
+    for i in range(n):
+        at = eoff + i * struct.calcsize(ENTRY)
+        kind, chunks, off, size, pairs, _ = struct.unpack(ENTRY, raw[at:at + struct.calcsize(ENTRY)])
+        out.setdefault(kind, struct.unpack(f"<{size // 4}I", raw[off:off + size]))
+
+    return isa, wave, out
+
+
+def disassemble(dwords, mcpu, wave):
+    """Run the dwords through knod-disasm and return its lines."""
+    dump = [f"# mcpu {mcpu}", f"# wave {wave}", "# format block"]
+    for i in range(0, len(dwords), 8):
+        dump.append(" ".join(f"{d:08x}" for d in dwords[i:i + 8]))
+
+    got = subprocess.run(["knod-disasm"], input="\n".join(dump) + "\n",
+                         capture_output=True, text=True)
+    if got.returncode != 0:
+        sys.exit(f"knod-blob-check: knod-disasm failed:\n{got.stderr.strip()}")
+
+    return parse(got.stdout, 16)
+
+
+def parse(text, base):
+    out = []
+    for line in text.splitlines():
+        got = INSN_RE.match(line)
+        if got:
+            out.append((int(got.group(1), base), got.group(2)))
+    return out
+
+
+def kernel_prologue(dump):
+    """The prologue section of a debugfs dump, up to where the JIT takes over.
+
+    What follows the fixed part is the exec-save zeroing, one instruction per
+    pair the program's control flow needs, so the comparison stops there.
+    """
+    section = []
+    inside = False
+    for line in dump.splitlines():
+        if "===[PROLOGUE]===" in line:
+            inside = True
+            continue
+        if inside and line.startswith("==="):
+            break
+        if inside:
+            section.append(line)
+
+    if not section:
+        sys.exit("knod-blob-check: the dump has no prologue section")
+
+    return parse("\n".join(section), 10)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("dump", help="a debugfs insn file, or a copy of one")
+    ap.add_argument("blob", help="the blob built for the same GPU")
+    ap.add_argument("--quiet", action="store_true",
+                    help="say nothing unless they differ")
+    args = ap.parse_args()
+
+    isa, wave, entries = read_blob(args.blob)
+    if KIND_PROLOGUE not in entries:
+        sys.exit(f"{args.blob}: holds no prologue")
+    if isa not in MCPU:
+        sys.exit(f"{args.blob}: unknown isa {isa}")
+
+    want = kernel_prologue(open(args.dump).read())
+    got = disassemble(entries[KIND_PROLOGUE], MCPU[isa], wave)
+
+    # The kernel's prologue carries the variable tail; compare what the blob
+    # covers and say so if the tail is missing rather than reporting a length
+    # mismatch nobody can act on.
+    if len(want) < len(got):
+        sys.exit(f"knod-blob-check: the dump ends after {len(want)} "
+                 f"instructions, the blob has {len(got)}")
+
+    bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]
+    for i, w, g in bad:
+        print(f"[{i}] kernel {w[0]:5}  {w[1]}")
+        print(f"     blob   {g[0]:5}  {g[1]}")
+
+    if bad:
+        sys.exit(f"knod-blob-check: {len(bad)} of {len(got)} differ")
+    if not args.quiet:
+        print(f"knod-blob-check: {len(got)} instructions match, "
+              f"{len(want) - len(got)} more emitted by the JIT after them")
+
+
+if __name__ == "__main__":
+    main()

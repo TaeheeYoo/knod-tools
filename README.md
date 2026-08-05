@@ -29,3 +29,22 @@ llvm-objdump works out and which is worth having - a backward branch's operand
 prints as a large unsigned number.
 
 Requires `llvm-mc` and `llvm-objdump` on PATH.
+
+## knod-blob-check
+
+Checks a prebuilt routine against what the kernel's JIT emits for the same
+thing.
+
+    knod-blob-check /sys/kernel/debug/dri/128/knod/bpf/insn \
+                    ~/proj/knod-blob/build/knod-bpf-gfx10.bin
+
+The two have to agree instruction for instruction and nothing says so on its
+own - editing one is not a build error in the other, and a shader wrong in this
+way reads the wrong memory rather than faulting. Run it after touching either.
+
+Only the prologue is covered so far: it is the one routine the kernel emits
+somewhere a dump shows whole. What the JIT emits after it varies with the
+program, so the comparison stops where the fixed part does and says how much
+was left.
+
+Needs `knod-disasm` on PATH.
