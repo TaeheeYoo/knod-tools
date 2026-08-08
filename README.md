@@ -24,6 +24,12 @@ Two layouts turn up, and a dump says which one it is:
   the program rather than the ISA, so it is left alone; only the dwords are
   replaced, and the `; bpf#N` tags are lined up afterwards.
 
+A dump can use both.  The BPF one does: its body is annotated, but its
+prologue is a block, because part of that may have been spliced in from a
+prebuilt routine and the kernel cannot say where the instructions inside it
+begin.  `# format` and `# base` apply from where they appear until the next
+one, so they read per section rather than per file.
+
 Branches show where they land as well as the distance they encode, which
 llvm-objdump works out and which is worth having - a backward branch's operand
 prints as a large unsigned number.

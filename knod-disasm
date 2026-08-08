@@ -156,12 +156,13 @@ def disassemble(dwords, mcpu, wave):
     return insns
 
 
-def emit_block(text, mcpu, wave, show_hex):
+def emit_block(text, mcpu, wave, show_hex, base=0):
     dwords = parse_block(text)
     if not dwords:
-        sys.exit("knod-disasm: no hex dwords in the dump")
+        return
 
     for off, raw, insn in disassemble(dwords, mcpu, wave):
+        off += base
         if show_hex:
             hexed = " ".join(f"{d:08x}" for d in raw)
             print(f"{off:04x}: {hexed:<26} {insn}")
@@ -243,10 +244,43 @@ def main():
             print(f"# {key} {meta[key]}")
     print(f"# {mcpu}, wave{wave}\n")
 
-    if meta.get("format", "block") == "annotated":
-        emit_annotated(text, mcpu, wave, args.hex)
-    else:
-        emit_block(text, mcpu, wave, args.hex)
+    emit(text, mcpu, wave, args.hex, meta.get("format", "block"))
+
+
+def emit(text, mcpu, wave, show_hex, default):
+    """Walk the dump, switching layout where it says to.
+
+    A dump can hold both: the BPF body is annotated, but the prologue is a run
+    of dwords, because part of it may have been spliced in whole and the kernel
+    cannot say where the instructions in that part begin.
+    """
+    mode, base, run = default, 0, []
+
+    def flush():
+        if not run:
+            return
+        if mode == "annotated":
+            emit_annotated("\n".join(run), mcpu, wave, show_hex)
+        else:
+            emit_block("\n".join(run), mcpu, wave, show_hex, base)
+        run.clear()
+
+    for line in text.splitlines():
+        got = re.match(r"^#\s*(format|base)\s+(\S+)", line.strip())
+        if got:
+            flush()
+            if got.group(1) == "format":
+                mode, base = got.group(2), 0
+            else:
+                base = int(got.group(2), 0)
+            continue
+        if line.startswith("==="):
+            flush()
+            print(line)
+            continue
+        run.append(line)
+
+    flush()
 
 
 if __name__ == "__main__":

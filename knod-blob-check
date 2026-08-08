@@ -76,6 +76,8 @@ def kernel_prologue(path):
 
     The dump holds dwords, so it goes through knod-disasm the same way the blob
     does - naming them two different ways would compare two different things.
+    The prologue is laid out as a block either way, whether the JIT emitted it
+    or spliced it in, so the two dumps read the same and this reads both.
 
     What follows the fixed part is the exec-save zeroing, one instruction per
     pair the program's control flow needs, so the comparison stops there.
@@ -99,7 +101,7 @@ def kernel_prologue(path):
     if not section:
         sys.exit("knod-blob-check: the dump has no prologue section")
 
-    return parse("\n".join(section), 10)
+    return parse("\n".join(section), 16)
 
 
 def main():
