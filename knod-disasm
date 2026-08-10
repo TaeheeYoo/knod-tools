@@ -14,6 +14,7 @@ per GPU generation.
 import argparse
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -284,4 +285,7 @@ def emit(text, mcpu, wave, show_hex, default):
 
 
 if __name__ == "__main__":
+    # Reading this through `head` or `grep -m` closes the pipe early, which is
+    # a normal way to use it and not worth a traceback.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     main()
