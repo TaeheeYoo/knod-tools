@@ -9,8 +9,8 @@ wrong memory rather than fault.
 
   knod-blob-check /sys/kernel/debug/dri/128/knod/bpf/insn build/knod-bpf-gfx10.bin
 
-Only the prologue is checked today, because it is the only routine the kernel
-emits in a place a dump shows whole.
+The prologue and the two halves of the epilogue are checked; those are the
+routines the kernel emits somewhere a dump shows them whole.
 """
 
 import argparse
@@ -23,6 +23,8 @@ HDR = "<8I"
 ENTRY = "<6I"
 MAGIC = 0x4b4e4442
 KIND_PROLOGUE = 9
+KIND_EPILOGUE_PRE = 10
+KIND_EPILOGUE_POST = 11
 
 MCPU = {9: "gfx900", 10: "gfx1030", 11: "gfx1100"}
 
@@ -62,16 +64,23 @@ def disassemble(dwords, mcpu, wave):
     return parse(got.stdout, 16)
 
 
+# knod-disasm works out where a branch lands and prints it after the
+# instruction.  That is an absolute address, so it moves with the routine and
+# is not part of what is being compared - the displacement is.
+TARGET_RE = re.compile(r"\s+->\s+[0-9a-f]+$")
+
+
 def parse(text, base):
     out = []
     for line in text.splitlines():
         got = INSN_RE.match(line)
         if got:
-            out.append((int(got.group(1), base), got.group(2)))
+            out.append((int(got.group(1), base),
+                        TARGET_RE.sub("", got.group(2))))
     return out
 
 
-def kernel_prologue(path):
+def kernel_section(path, marker):
     """The prologue section of a debugfs dump, up to where the JIT takes over.
 
     The dump holds dwords, so it goes through knod-disasm the same way the blob
@@ -90,7 +99,7 @@ def kernel_prologue(path):
     section = []
     inside = False
     for line in got.stdout.splitlines():
-        if "===[PROLOGUE]===" in line:
+        if marker in line:
             inside = True
             continue
         if inside and line.startswith("==="):
@@ -99,9 +108,32 @@ def kernel_prologue(path):
             section.append(line)
 
     if not section:
-        sys.exit("knod-blob-check: the dump has no prologue section")
+        sys.exit(f"knod-blob-check: the dump has no {marker} section")
 
     return parse("\n".join(section), 16)
+
+
+def compare(what, want, got, quiet):
+    """-> how many instructions differ.
+
+    The offsets are shown but not compared: the kernel counts them in decimal
+    and knod-disasm in hex, and instructions matching in sequence are the same
+    length anyway.
+    """
+    if len(want) < len(got):
+        print(f"{what}: the dump ends after {len(want)} instructions, "
+              f"the routine has {len(got)}")
+        return len(got) - len(want)
+
+    bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w[1] != g[1]]
+    for i, w, g in bad:
+        print(f"{what} [{i}] kernel  {w[0]:5}  {w[1]}")
+        print(f"{' ' * len(what)}       routine {g[0]:5}  {g[1]}")
+
+    if not bad and not quiet:
+        print(f"{what}: {len(got)} instructions match, "
+              f"{len(want) - len(got)} more emitted by the JIT after them")
+    return len(bad)
 
 
 def main():
@@ -113,34 +145,41 @@ def main():
     args = ap.parse_args()
 
     isa, wave, entries = read_blob(args.blob)
-    if KIND_PROLOGUE not in entries:
-        sys.exit(f"{args.blob}: holds no prologue")
     if isa not in MCPU:
         sys.exit(f"{args.blob}: unknown isa {isa}")
 
-    want = kernel_prologue(args.dump)
-    got = disassemble(entries[KIND_PROLOGUE], MCPU[isa], wave)
+    # The epilogue is in two pieces with a run the JIT emits between them, so
+    # the second is lined up by its last instruction rather than by where the
+    # section starts.
+    checks = [
+        ("prologue", KIND_PROLOGUE, "===[PROLOGUE]===", False),
+        ("epilogue_pre", KIND_EPILOGUE_PRE, "===[EPILOG]===", False),
+        ("epilogue_post", KIND_EPILOGUE_POST, "===[EPILOG]===", True),
+    ]
 
-    # The kernel's prologue carries the variable tail; compare what the blob
-    # covers and say so if the tail is missing rather than reporting a length
-    # mismatch nobody can act on.
-    if len(want) < len(got):
-        sys.exit(f"knod-blob-check: the dump ends after {len(want)} "
-                 f"instructions, the blob has {len(got)}")
+    bad = 0
+    for what, kind, marker, from_end in checks:
+        if kind not in entries:
+            print(f"{what}: not in this blob", file=sys.stderr)
+            continue
 
-    # Compare the instructions themselves.  The offsets are shown but not
-    # compared: the kernel counts them in decimal and knod-disasm in hex, and
-    # instructions that match in sequence are the same length anyway.
-    bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w[1] != g[1]]
-    for i, w, g in bad:
-        print(f"[{i}] kernel {w[0]:5}  {w[1]}")
-        print(f"     blob   {g[0]:5}  {g[1]}")
+        got = disassemble(entries[kind], MCPU[isa], wave)
+        want = kernel_section(args.dump, marker)
+
+        if from_end:
+            at = next((i for i in range(len(want) - 1, -1, -1)
+                       if want[i][1] == got[-1][1]), None)
+            if at is None:
+                print(f"{what}: the dump never reaches its last instruction")
+                bad += 1
+                continue
+            want = want[max(0, at + 1 - len(got)):at + 1]
+
+        bad += compare(what, want, got, args.quiet)
 
     if bad:
-        sys.exit(f"knod-blob-check: {len(bad)} of {len(got)} differ")
-    if not args.quiet:
-        print(f"knod-blob-check: {len(got)} instructions match, "
-              f"{len(want) - len(got)} more emitted by the JIT after them")
+        sys.exit(f"knod-blob-check: {bad} differ")
+
 
 
 if __name__ == "__main__":
